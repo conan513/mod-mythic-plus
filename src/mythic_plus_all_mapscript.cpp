@@ -274,13 +274,15 @@ public:
                         // Enumerate all map creatures; count non-boss, eligible ones.
                         {
                             uint32 trashCount = 0;
-                            map->DoForAllCreatures([&](Creature* c) {
+                            for (auto const& pair : map->GetCreatureBySpawnIdStore())
+                            {
+                                Creature* c = pair.second;
                                 if (c && !c->IsDungeonBoss() && !sMythicPlus->IsFinalBoss(c->GetEntry())
                                     && sMythicPlus->CanProcessCreature(c) && c->IsAlive())
                                 {
                                     ++trashCount;
                                 }
-                            });
+                            }
                             mapData->totalTrashCount    = trashCount;
                             // Require 80% of trash to be killed (retail standard)
                             mapData->requiredTrashKills = (trashCount * 80) / 100;
