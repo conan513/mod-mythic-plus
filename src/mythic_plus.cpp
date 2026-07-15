@@ -232,6 +232,9 @@ void MythicPlus::LoadFromDB()
     // Retail: load Great Vault state
     LoadGreatVaultFromDB();
 
+    // Retail: load per-player dungeon-bound keystones
+    LoadPlayerKeystones();
+
     // Retail: apply deterministic weekly affix seed if enabled
     if (weeklyAffixesEnabled)
         ApplyWeeklyAffixSeed();
@@ -1107,6 +1110,20 @@ void MythicPlus::ScaleCreature(Creature* creature)
     if (mapScale != nullptr)
         creatureData->extraDamageMultiplier = boss ? mapScale->bossDmgScale : mapScale->trashDmgScale;
 
+    // ── Retail: Tyrannical & Fortified affix damage multiplier ──────────────
+    // Applied on top of the existing damage multiplier so both stack correctly.
+    {
+        MythicPlus::MapData* mapData = GetMapData(map, false);
+        if (mapData && mapData->mythicLevel)
+        {
+            float hpMult = 1.0f, dmgMult = 1.0f;
+            GetTyranFortMultipliers(creature, mapData->mythicLevel->level, hpMult, dmgMult);
+            creatureData->extraDamageMultiplier *= dmgMult;
+            // HP multiplier is applied below after base health is set
+            // Store it temporarily via a lambda captured after base health calc.
+        }
+    }
+
     // only scale creatures from lower level dungeons
     if (creature->GetLevel() >= DEFAULT_MAX_LEVEL)
         return;
@@ -1128,8 +1145,20 @@ void MythicPlus::ScaleCreature(Creature* creature)
     if (map->IsHeroic())
         hpMod = boss ? urand(30, 31) : 5;
 
+    // ── Retail: Tyrannical & Fortified HP multiplier ─────────────────────────
+    float tyranFortHpMult = 1.0f;
+    {
+        MythicPlus::MapData* mapData = GetMapData(map, false);
+        if (mapData && mapData->mythicLevel)
+        {
+            float _hpMult = 1.0f, _dmgMult = 1.0f;
+            GetTyranFortMultipliers(creature, mapData->mythicLevel->level, _hpMult, _dmgMult);
+            tyranFortHpMult = _hpMult;
+        }
+    }
+
     // scale health
-    uint32 health = stats->BaseHealth[exp] * hpMod * Utils::HealthMod(cInfo->rank);
+    uint32 health = (uint32)((float)(stats->BaseHealth[exp] * hpMod * Utils::HealthMod(cInfo->rank)) * tyranFortHpMult);
     creature->SetCreateHealth(health);
     creature->SetMaxHealth(health);
     creature->SetHealth(health);
@@ -1388,11 +1417,11 @@ void MythicPlus::AutoUpgradeKeystoneForMap(Map* map, uint64 totalTime, uint32 ti
     if (!autoUpgradeKeystone)
         return;
 
-    // Get group leader
     Map::PlayerList const& players = map->GetPlayers();
     if (players.IsEmpty())
         return;
 
+    // Find the group leader
     Player* leader = nullptr;
     for (Map::PlayerList::const_iterator itr = players.begin(); itr != players.end(); ++itr)
     {
@@ -1402,12 +1431,10 @@ void MythicPlus::AutoUpgradeKeystoneForMap(Map* map, uint64 totalTime, uint32 ti
             {
                 ObjectGuid leaderGuid = pl->GetGroup()->GetLeaderGUID();
                 leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
-                if (leader)
-                    break;
+                if (leader) break;
             }
             else
             {
-                // Solo player (if supported/configured)
                 leader = pl;
                 break;
             }
@@ -1417,52 +1444,59 @@ void MythicPlus::AutoUpgradeKeystoneForMap(Map* map, uint64 totalTime, uint32 ti
     if (!leader)
         return;
 
-    uint32 currentLvl = GetCurrentMythicPlusLevel(leader);
-    if (currentLvl == 0)
-        return;
-
     KeystoneUpgradeTier tier = GetUpgradeTier(totalTime, timeLimit);
     int32 levelDiff = static_cast<int32>(tier);
 
-    int32 newLevel = static_cast<int32>(currentLvl) + levelDiff;
-    if (newLevel < 2)
-        newLevel = 2; // minimum is 2
-
-    // Apply the level change to the leader
-    SetCurrentMythicPlusLevel(leader, static_cast<uint32>(newLevel), true);
-
-    // Apply to all group members who also had that level or update their personal keystones if they had one
-    // In retail, a keystone itself updates. Here, player level is saved per player.
-    // Let's announce the keystone upgrade/downgrade to everyone
-    std::string announceMsg;
-    if (levelDiff > 0)
-    {
-        announceMsg = "Keystone upgraded by +" + Acore::ToString(levelDiff) + "! New level: " + Acore::ToString(newLevel);
-        // Also reward a new keystone item if they don't have one (though in retail it just transforms)
-    }
-    else
-    {
-        announceMsg = "Keystone depleted. Level decreased by 1. New level: " + Acore::ToString(newLevel);
-    }
-
+    // ── Retail: Update each player's dungeon-bound keystone ─────────────────
+    // On success: reroll to a NEW random dungeon at upgraded level.
+    // On failure: keep same dungeon, drop level by 1.
     for (Map::PlayerList::const_iterator itr = players.begin(); itr != players.end(); ++itr)
     {
         if (Player* pl = itr->GetSource())
         {
-            BroadcastToPlayer(pl, Utils::GreenColored(announceMsg));
-            // Also sync group members M+ level to leader's new level if they don't have group or if we want them to progress together
-            if (pl != leader)
+            PlayerKeystone ks;
+            if (!GetPlayerKeystone(pl, ks))
             {
-                // In retail, only the keystone owner's keystone upgrades/changes.
-                // But in this mod, the leader's level is used to start it.
-                // We should keep the leader's level as the source of truth, but we can also update group members levels to match so they can run it next time.
-                SetCurrentMythicPlusLevel(pl, static_cast<uint32>(newLevel), true);
+                // Player had no bound keystone — skip individual update
+                continue;
             }
 
-            // Give them the keystone item if configured
-            if (levelDiff > 0 && dropKeystoneOnCompletion)
+            int32 newLevel = static_cast<int32>(ks.level) + levelDiff;
+            if (newLevel < 2) newLevel = 2;
+
+            if (beaten && levelDiff > 0)
             {
-                // Remove old keystone and reward new one
+                // Success: reroll dungeon + upgrade level
+                RollNewKeystone(pl, ks.mapId, static_cast<uint32>(newLevel));
+            }
+            else
+            {
+                // Failure: same dungeon, deplete by 1
+                DepleteKeystone(pl);
+            }
+
+            SyncKeystoneToClient(pl);
+
+            // Announce
+            std::string announceMsg;
+            if (levelDiff > 0 && beaten)
+            {
+                announceMsg = "Keystone upgraded by +" + Acore::ToString(levelDiff) +
+                              "! New level: " + Acore::ToString(newLevel) +
+                              " (new dungeon assigned).";
+                BroadcastToPlayer(pl, Utils::GreenColored(announceMsg));
+            }
+            else
+            {
+                PlayerKeystone ksNow;
+                GetPlayerKeystone(pl, ksNow);
+                announceMsg = "Keystone depleted. Level decreased to " + Acore::ToString(ksNow.level);
+                BroadcastToPlayer(pl, Utils::RedColored(announceMsg));
+            }
+
+            // Reward keystone item if configured
+            if (dropKeystoneOnCompletion)
+            {
                 RemoveKeystone(pl);
                 RewardKeystone(pl);
             }
@@ -1553,6 +1587,151 @@ void MythicPlus::ApplyWeeklyAffixSeed()
                 }
             }
         }
+    }
+}
+
+// ── Retail: Dungeon-Bound Player Keystones ────────────────────────────────────
+
+void MythicPlus::LoadPlayerKeystones()
+{
+    QueryResult result = CharacterDatabase.Query("SELECT guid, map_id, level FROM modernwow_mythicplus_player_keystones");
+    if (!result)
+        return;
+
+    uint32 count = 0;
+    do
+    {
+        Field* fields = result->Fetch();
+        uint32 guid  = fields[0].Get<uint32>();
+        uint32 mapId = fields[1].Get<uint32>();
+        uint32 lvl   = fields[2].Get<uint32>();
+        playerKeystones[guid] = { mapId, lvl };
+        ++count;
+    } while (result->NextRow());
+
+    LOG_INFO("module", "Mythic Plus: Loaded {} player keystones.", count);
+}
+
+bool MythicPlus::HasKeystoneForMap(Player* player, uint32 mapId) const
+{
+    uint32 guid = Utils::PlayerGUID(player);
+    auto it = playerKeystones.find(guid);
+    if (it == playerKeystones.end())
+        return false;
+    return it->second.mapId == mapId;
+}
+
+void MythicPlus::SetPlayerKeystone(Player* player, uint32 mapId, uint32 level)
+{
+    uint32 guid = Utils::PlayerGUID(player);
+    playerKeystones[guid] = { mapId, level };
+    CharacterDatabase.Execute(
+        "REPLACE INTO modernwow_mythicplus_player_keystones (guid, map_id, level) VALUES ({}, {}, {})",
+        guid, mapId, level);
+}
+
+bool MythicPlus::GetPlayerKeystone(Player* player, PlayerKeystone& out) const
+{
+    uint32 guid = Utils::PlayerGUID(player);
+    auto it = playerKeystones.find(guid);
+    if (it == playerKeystones.end())
+        return false;
+    out = it->second;
+    return true;
+}
+
+void MythicPlus::RollNewKeystone(Player* player, uint32 /*completedMapId*/, uint32 newLevel)
+{
+    // Pick a new random dungeon (retail: reroll to different dungeon)
+    uint32 newMapId = GetRandomMythicPlusMap();
+    if (newMapId == 0)
+    {
+        // fallback: keep old map if we can't find another
+        PlayerKeystone ks;
+        if (GetPlayerKeystone(player, ks))
+            newMapId = ks.mapId;
+    }
+    SetPlayerKeystone(player, newMapId, newLevel);
+}
+
+void MythicPlus::DepleteKeystone(Player* player)
+{
+    PlayerKeystone ks;
+    if (!GetPlayerKeystone(player, ks))
+        return;
+
+    uint32 newLevel = (ks.level > 2) ? ks.level - 1 : 2;
+    // Keep same dungeon on depletion (retail behaviour)
+    SetPlayerKeystone(player, ks.mapId, newLevel);
+}
+
+uint32 MythicPlus::GetRandomMythicPlusMap(uint32 excludeMapId) const
+{
+    std::vector<uint32> available;
+    for (auto& pair : mythicPlusDungeons)
+    {
+        if (pair.first != excludeMapId)
+            available.push_back(pair.first);
+    }
+    if (available.empty())
+        return excludeMapId; // fallback
+
+    return available[urand(0, (uint32)available.size() - 1)];
+}
+
+void MythicPlus::SyncKeystoneToClient(Player* player)
+{
+    PlayerKeystone ks;
+    if (!GetPlayerKeystone(player, ks))
+        return;
+
+    // Look up the map name from the DBC (MapEntry)
+    MapEntry const* entry = sMapStore.LookupEntry(ks.mapId);
+    std::string mapName = entry ? entry->name[0] : "Unknown Dungeon";
+
+    // Send: M+:KEYSTONE:<mapId>:<level>:<mapName>
+    std::string msg = "M+:KEYSTONE:" + Acore::ToString(ks.mapId) + ":" +
+                      Acore::ToString(ks.level) + ":" + mapName;
+    Utils::SendAddonMessage(player, "MODERNWOW", msg);
+}
+
+// ── Retail: Tyrannical & Fortified Weekly Affixes ─────────────────────────────
+
+bool MythicPlus::IsFortifiedWeek() const
+{
+    // Even ISO weeks = Fortified, Odd ISO weeks = Tyrannical
+    return (GetCurrentISOWeek() % 2) == 0;
+}
+
+void MythicPlus::GetTyranFortMultipliers(Creature* creature, uint32 mythicLevel,
+                                          float& hpMult, float& dmgMult) const
+{
+    hpMult  = 1.0f;
+    dmgMult = 1.0f;
+
+    if (mythicLevel < 7)
+        return; // no Tyrannical/Fortified below level 7
+
+    bool boss  = IsBoss(creature);
+    bool fortified  = IsFortifiedWeek();
+    bool tyrannical = !fortified;
+
+    // At level 10+ both affixes are active simultaneously
+    bool bothActive = (mythicLevel >= 10);
+
+    // Fortified:  trash +30% HP, +20% damage
+    // Tyrannical: bosses +25% HP, +15% damage
+
+    if ((fortified || bothActive) && !boss)
+    {
+        hpMult  *= 1.30f;
+        dmgMult *= 1.20f;
+    }
+
+    if ((tyrannical || bothActive) && boss)
+    {
+        hpMult  *= 1.25f;
+        dmgMult *= 1.15f;
     }
 }
 

@@ -56,6 +56,11 @@ public:
         uint32 penaltyOnDeath = 0;
         uint32 deaths = 0;
 
+        // Retail: Trash completion requirement tracking
+        uint32 totalTrashCount = 0;
+        uint32 killedTrashCount = 0;
+        uint32 requiredTrashKills = 0;
+
         uint32 GetPenaltyTime() const
         {
             return penaltyOnDeath * deaths;
@@ -320,19 +325,38 @@ public:
     void CheckWeeklyReset();
 
     // ── Retail: Auto Keystone Upgrade ────────────────────────────────────────
-    // Determines upgrade tier and adjusts the player's stored keystone level.
-    // totalTime  — elapsed seconds
-    // timeLimit  — dungeon timer limit in seconds
-    // beaten     — true if finished within time limit
     void AutoUpgradeKeystoneForMap(Map* map, uint64 totalTime, uint32 timeLimit, bool beaten);
     KeystoneUpgradeTier GetUpgradeTier(uint64 totalTime, uint32 timeLimit) const;
 
     // ── Retail: Weekly Affix Rotation ────────────────────────────────────────
-    // Returns the active affix indices for the current ISO week.
-    // Used when WeeklyAffixes is enabled to override random per-restart affixes.
     static uint32 GetCurrentISOWeek();  // 1-53
     static uint32 GetCurrentISOYear();
     void ApplyWeeklyAffixSeed();        // called at startup & weekly reset
+
+    // ── Retail: Dungeon-Bound Player Keystones ───────────────────────────────
+    struct PlayerKeystone
+    {
+        uint32 mapId  = 0;  // which dungeon this keystone is for
+        uint32 level  = 2;  // keystone level
+    };
+
+    void   LoadPlayerKeystones();
+    bool   HasKeystoneForMap(Player* player, uint32 mapId) const;
+    void   SetPlayerKeystone(Player* player, uint32 mapId, uint32 level);
+    bool   GetPlayerKeystone(Player* player, PlayerKeystone& out) const;
+    void   RollNewKeystone(Player* player, uint32 completedMapId, uint32 newLevel);
+    void   DepleteKeystone(Player* player);
+    uint32 GetRandomMythicPlusMap(uint32 excludeMapId = 0) const;
+    void   SyncKeystoneToClient(Player* player);
+
+    // ── Retail: Tyrannical & Fortified Weekly Affixes ───────────────────────
+    // Fortified weeks: even ISO-week; Tyrannical weeks: odd ISO-week.
+    // At level 10+ both are active simultaneously.
+    bool IsFortifiedWeek() const;   // true = Fortified, false = Tyrannical
+    // Returns combined HP / damage multipliers from Tyrannical/Fortified
+    // for the given creature (boss vs trash).  Only non-zero when M+ >= 7.
+    void GetTyranFortMultipliers(Creature* creature, uint32 mythicLevel,
+                                 float& hpMult, float& dmgMult) const;
 private:
     std::unordered_map<uint32, MythicPlusCapableDungeon> mythicPlusDungeons;
     std::unordered_map<uint32, MythicPlusDungeonInfo> mythicPlusDungeonInfo;
@@ -353,8 +377,11 @@ private:
     uint32 greatVaultItemEntry    = 29434;  // default: Badges of Justice
 
     // ── Great Vault store ────────────────────────────────────────────────────
-    // key: character guid
     std::unordered_map<uint32, GreatVaultEntry> greatVaultData;
+
+    // ── Player Keystones store ───────────────────────────────────────────────
+    // key: character guid
+    std::unordered_map<uint32, PlayerKeystone> playerKeystones;
 
     // ── Weekly tracking ──────────────────────────────────────────────────────
     uint16 lastKnownWeek = 0;

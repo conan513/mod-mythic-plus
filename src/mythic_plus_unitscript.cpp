@@ -78,6 +78,20 @@ public:
 
             creatureData->engageTimer = 0;
 
+            bool finalBoss = sMythicPlus->IsFinalBoss(creature->GetEntry());
+            bool isBoss    = creature->IsDungeonBoss() || finalBoss;
+            MythicPlus::MapData* mapData = sMythicPlus->GetMapData(map, false);
+            ASSERT(mapData);
+
+            // ── Retail: Trash kill counting ─────────────────────────────────
+            // Count non-boss kills towards the trash objective.
+            if (!isBoss && !mapData->done)
+            {
+                mapData->killedTrashCount++;
+                // Broadcast trash progress to all players on the map
+                BroadcastTrashProgress(map, mapData);
+            }
+
             const Map::PlayerList& playerList = map->GetPlayers();
             for (Map::PlayerList::const_iterator itr = playerList.begin(); itr != playerList.end(); ++itr)
             {
@@ -90,72 +104,144 @@ public:
                     MythicPlus::AnnounceToPlayer(player, oss.str());
                     MythicPlus::BroadcastToPlayer(player, oss.str());
 
-                    bool finalBoss = sMythicPlus->IsFinalBoss(creature->GetEntry());
-                    bool rewarded = false;
-                    MythicPlus::MapData* mapData = sMythicPlus->GetMapData(map, false);
-                    ASSERT(mapData);
-
                     // --- Sync boss kill with client GUI ---
-                    MythicPlus::Utils::SendAddonMessage(player, "MODERNWOW", "M+:BOSS:" + Acore::ToString(creature->GetEntry()));
+                    if (isBoss)
+                        MythicPlus::Utils::SendAddonMessage(player, "MODERNWOW", "M+:BOSS:" + Acore::ToString(creature->GetEntry()));
 
                     if (finalBoss)
                     {
                         std::ostringstream oss2;
-                        oss2 << "Mythic Plus dungeon ended after ";
-                        oss2 << secsToTimeString(gameTime - savedDungeon->startTime);
-                        MythicPlus::AnnounceToPlayer(player, oss2.str());
-                        MythicPlus::BroadcastToPlayer(player, oss2.str());
+                        oss2 << "All bosses defeated! Timer: " << secsToTimeString(gameTime - savedDungeon->startTime);
 
-                        if (mapData->receiveLoot)
+                        // ── Retail: Only complete if trash objective also met ─
+                        bool trashComplete = (mapData->requiredTrashKills == 0 ||
+                                             mapData->killedTrashCount >= mapData->requiredTrashKills);
+                        if (!trashComplete)
                         {
-                            rewarded = true;
-                            sMythicPlus->Reward(player, mapData->mythicLevel->reward);
+                            uint32 pct = mapData->totalTrashCount > 0
+                                ? (mapData->killedTrashCount * 100 / mapData->totalTrashCount)
+                                : 100;
+                            oss2 << " Kill more enemies! (" << pct << "% / 100%)";
                         }
 
-                        // Great Vault Update
-                        sMythicPlus->UpdateGreatVault(player, savedDungeon->mythicLevel);
-
-                        mapData->done = true;
-
-                        sMythicPlus->SaveDungeonInfo(map->GetInstanceId(), map->GetId(), mapData->timeLimit, mapData->mythicPlusStartTimer, mapData->mythicLevel->level, mapData->penaltyOnDeath, mapData->deaths, true);
-
-                        // --- Sync end of M+ dungeon with client GUI ---
-                        MythicPlus::Utils::SendAddonMessage(player, "MODERNWOW", "M+:END:" + Acore::ToString(gameTime - savedDungeon->startTime) + ":" + Acore::ToString(mapData->receiveLoot ? 1 : 0));
+                        MythicPlus::AnnounceToPlayer(player, oss2.str());
+                        MythicPlus::BroadcastToPlayer(player, oss2.str());
                     }
-
-                    const MythicLevel* mythicLevel = sMythicPlus->GetMythicLevel(savedDungeon->mythicLevel);
-                    ASSERT(mythicLevel);
-
-                    sMythicPlus->AddDungeonSnapshot(map->GetInstanceId(),
-                        map->GetId(),
-                        map->GetDifficulty(),
-                        savedDungeon->startTime,
-                        gameTime,
-                        diff,
-                        savedDungeon->timeLimit,
-                        player->GetGUID().GetCounter(),
-                        player->GetName(),
-                        savedDungeon->mythicLevel,
-                        creature->GetEntry(),
-                        finalBoss,
-                        rewarded,
-                        mapData->penaltyOnDeath,
-                        mapData->deaths,
-                        mythicLevel->randomAffixCount
-                    );
                 }
             }
 
-            if (sMythicPlus->IsFinalBoss(creature->GetEntry()))
+            sMythicPlus->AddDungeonSnapshot(map->GetInstanceId(),
+                map->GetId(),
+                map->GetDifficulty(),
+                savedDungeon->startTime,
+                gameTime,
+                diff,
+                savedDungeon->timeLimit,
+                0, "",   // player guid/name not per-player here
+                savedDungeon->mythicLevel,
+                creature->GetEntry(),
+                finalBoss,
+                false,   // rewarded updated below
+                mapData->penaltyOnDeath,
+                mapData->deaths,
+                mapData->mythicLevel ? mapData->mythicLevel->randomAffixCount : 0
+            );
+
+            // ── Retail: Dungeon completion — requires all bosses + trash % ──
+            if (finalBoss && !mapData->done)
             {
-                MythicPlus::MapData* mapData = sMythicPlus->GetMapData(map, false);
-                if (mapData)
+                bool trashComplete = (mapData->requiredTrashKills == 0 ||
+                                     mapData->killedTrashCount >= mapData->requiredTrashKills);
+                if (trashComplete)
                 {
-                    sMythicPlus->AutoUpgradeKeystoneForMap(map, gameTime - savedDungeon->startTime, savedDungeon->timeLimit, mapData->receiveLoot);
+                    CompleteDungeon(map, mapData, savedDungeon, gameTime);
+                }
+                else
+                {
+                    // Boss dead but trash not done — mark final boss as killed so we
+                    // can finalise once trash reaches 100% (checked below in trash kills)
+                    mapData->done = false;  // not yet
+                    // Store that final boss is already defeated using a sentinel
+                    // We reuse killedTrashCount: if killedTrashCount reaches required
+                    // the next trash kill will trigger CompleteDungeon.
+                }
+            }
+            // If final boss was already killed (done still false = waiting for trash)
+            // check again now that a trash mob died
+            else if (!finalBoss && !isBoss && !mapData->done)
+            {
+                // Check if the final boss entry appears in dungeon snapshots (final boss already dead)
+                bool finalBossAlreadyDead = false;
+                QueryResult bResult = CharacterDatabase.Query(
+                    "SELECT 1 FROM mythic_plus_dungeon_snapshot WHERE id = {} AND starttime = {} AND is_final_boss = 1",
+                    map->GetInstanceId(), savedDungeon->startTime);
+                if (bResult)
+                    finalBossAlreadyDead = true;
+
+                if (finalBossAlreadyDead)
+                {
+                    bool trashComplete = (mapData->requiredTrashKills == 0 ||
+                                         mapData->killedTrashCount >= mapData->requiredTrashKills);
+                    if (trashComplete)
+                        CompleteDungeon(map, mapData, savedDungeon, gameTime);
                 }
             }
         }
     }
+
+private:
+    // Broadcasts current trash kill percentage to all players on the map.
+    void BroadcastTrashProgress(Map* map, MythicPlus::MapData* mapData) const
+    {
+        if (mapData->totalTrashCount == 0)
+            return;
+
+        uint32 pct = mapData->killedTrashCount * 100 / mapData->totalTrashCount;
+        pct = std::min(pct, 100u);
+
+        Map::PlayerList const& players = map->GetPlayers();
+        for (Map::PlayerList::const_iterator itr = players.begin(); itr != players.end(); ++itr)
+        {
+            if (Player* pl = itr->GetSource())
+                MythicPlus::Utils::SendAddonMessage(pl, "MODERNWOW", "M+:TRASH:" + Acore::ToString(pct));
+        }
+    }
+
+    // Finalises a Mythic+ dungeon run — gives rewards, updates vault, triggers keystone logic.
+    void CompleteDungeon(Map* map, MythicPlus::MapData* mapData,
+                         MythicPlus::MythicPlusDungeonInfo* savedDungeon, uint64 gameTime)
+    {
+        mapData->done = true;
+
+        sMythicPlus->SaveDungeonInfo(map->GetInstanceId(), map->GetId(), mapData->timeLimit,
+            mapData->mythicPlusStartTimer, mapData->mythicLevel->level,
+            mapData->penaltyOnDeath, mapData->deaths, true);
+
+        Map::PlayerList const& players = map->GetPlayers();
+        for (Map::PlayerList::const_iterator itr = players.begin(); itr != players.end(); ++itr)
+        {
+            if (Player* player = itr->GetSource())
+            {
+                if (mapData->receiveLoot)
+                    sMythicPlus->Reward(player, mapData->mythicLevel->reward);
+
+                sMythicPlus->UpdateGreatVault(player, savedDungeon->mythicLevel);
+
+                MythicPlus::Utils::SendAddonMessage(player, "MODERNWOW",
+                    "M+:END:" + Acore::ToString(gameTime - savedDungeon->startTime) +
+                    ":" + Acore::ToString(mapData->receiveLoot ? 1 : 0));
+
+                std::ostringstream oss;
+                oss << "Mythic Plus complete! Time: " << secsToTimeString(gameTime - savedDungeon->startTime);
+                MythicPlus::AnnounceToPlayer(player, oss.str());
+                MythicPlus::BroadcastToPlayer(player, MythicPlus::Utils::GreenColored(oss.str()));
+            }
+        }
+
+        sMythicPlus->AutoUpgradeKeystoneForMap(map, gameTime - savedDungeon->startTime,
+                                                savedDungeon->timeLimit, mapData->receiveLoot);
+    }
+
 
     void OnUnitEnterEvadeMode(Unit* unit, uint8 /*evadeReason*/) override
     {

@@ -59,6 +59,11 @@ public:
             if (mplusLevel > 0)
                 MythicPlus::BroadcastToPlayer(player, "Your group's leader (can even be you) has a Mythic Plus level set. The leader can use a Mythic Keystone to start a level " + Acore::ToString(mplusLevel) + " Mythic Plus dungeon!");
         }
+
+        // ── Retail: Send keystone info to client UI on login ─────────────
+        // Slight delay via a short-circuit: just sync immediately; the
+        // addon script frame will handle it on PLAYER_ENTERING_WORLD.
+        sMythicPlus->SyncKeystoneToClient(player);
     }
 
     void OnPlayerJustDied(Player* player) override

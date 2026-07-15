@@ -94,7 +94,17 @@ public:
                 {
                     long long diff = GameTime::GetGameTime().count() - mapData->mythicPlusStartTimer;
                     MythicPlus::Utils::SendAddonMessage(player, "MODERNWOW", "M+:TIME:" + Acore::ToString(diff) + ":" + Acore::ToString(mapData->deaths));
+
+                    // Send current trash percentage
+                    uint32 trashPct = mapData->totalTrashCount > 0
+                        ? std::min(mapData->killedTrashCount * 100 / mapData->totalTrashCount, 100u)
+                        : 0;
+                    MythicPlus::Utils::SendAddonMessage(player, "MODERNWOW", "M+:TRASH:" + Acore::ToString(trashPct));
+
+                    // Also sync keystone info
+                    sMythicPlus->SyncKeystoneToClient(player);
                 }
+
 
                 QueryResult bResult = CharacterDatabase.Query("SELECT creature_entry FROM mythic_plus_dungeon_snapshot WHERE id = {} AND starttime = {}", map->GetInstanceId(), savedDungeon->startTime);
                 if (bResult)
@@ -260,18 +270,40 @@ public:
                         mapData->deaths = 0;
                         mapData->penaltyOnDeath = sMythicPlus->GetPenaltyOnDeath();
 
+                        // ── Retail: Count trash creatures for objective tracking ──
+                        // Enumerate all map creatures; count non-boss, eligible ones.
+                        {
+                            uint32 trashCount = 0;
+                            map->DoForAllCreatures([&](Creature* c) {
+                                if (c && !c->IsDungeonBoss() && !sMythicPlus->IsFinalBoss(c->GetEntry())
+                                    && sMythicPlus->CanProcessCreature(c) && c->IsAlive())
+                                {
+                                    ++trashCount;
+                                }
+                            });
+                            mapData->totalTrashCount    = trashCount;
+                            // Require 80% of trash to be killed (retail standard)
+                            mapData->requiredTrashKills = (trashCount * 80) / 100;
+                            mapData->killedTrashCount   = 0;
+
+                            LOG_INFO("module", "Mythic Plus: Instance {} trash count={}, required={}",
+                                     instanceId, trashCount, mapData->requiredTrashKills);
+                        }
+
                         // --- Broadcast M+ START to all players on the map ---
                         Map::PlayerList const& players = map->GetPlayers();
                         for (Map::PlayerList::const_iterator itr = players.begin(); itr != players.end(); ++itr)
                         {
                             if (Player* pl = itr->GetSource())
                             {
-                                MythicPlus::Utils::SendAddonMessage(pl, "MODERNWOW", "M+:START:" + Acore::ToString(map->GetId()) + ":" + Acore::ToString(timeLimit) + ":" + Acore::ToString(mlevel) + ":" + Acore::ToString(0) + ":" + Acore::ToString(sMythicPlus->GetPenaltyOnDeath()));
+                                MythicPlus::Utils::SendAddonMessage(pl, "MODERNWOW", "M+:START:" + Acore::ToString(map->GetId()) + ":" + Acore::ToString(timeLimit) + ":" + Acore::ToString(mlevel) + ":0:" + Acore::ToString(sMythicPlus->GetPenaltyOnDeath()));
+                                MythicPlus::Utils::SendAddonMessage(pl, "MODERNWOW", "M+:TRASH:0");
                             }
                         }
 
                         if (mapData->penaltyOnDeath > 0)
                             sMythicPlus->BroadcastToMap(map, MythicPlus::Utils::RedColored("Dying will give a penalty of " + secsToTimeString(mapData->penaltyOnDeath)));
+
                     }
                     else
                         instanceTimer[instanceId] += diff;
