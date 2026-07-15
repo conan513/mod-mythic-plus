@@ -44,3 +44,68 @@ MythicPlus.KeystoneBuyTimer = 1440
 #
 
 MythicPlus.DropKeystoneOnDungeonComplete = 1
+
+#
+#    MythicPlus.AutoUpgradeKeystone
+#        Description: Automatically upgrades player keystones (+1, +2, or +3) when beating a dungeon timer.
+#        Values: 0 - Disabled
+#                1 - Enabled
+#        Default: 1
+#
+
+MythicPlus.AutoUpgradeKeystone = 1
+
+#
+#    MythicPlus.GreatVault.Enable
+#        Description: Enables the Great Vault weekly chest.
+#        Values: 0 - Disabled
+#                1 - Enabled
+#        Default: 1
+#
+
+MythicPlus.GreatVault.Enable = 1
+
+#
+#    MythicPlus.GreatVault.ItemEntry
+#        Description: The item entry rewarded from the weekly Great Vault.
+#        Default: 29434 - Badge of Justice
+#
+
+MythicPlus.GreatVault.ItemEntry = 29434
+
+#
+#    MythicPlus.TimerBroadcast.Enable
+#        Description: Periodically alerts players on remaining dungeon time inside M+.
+#        Values: 0 - Disabled
+#                1 - Enabled
+#        Default: 1
+#
+
+MythicPlus.TimerBroadcast.Enable = 1
+
+#
+#    MythicPlus.WeeklyAffixes.Enable
+#        Description: Ensures weekly affixes rotate deterministically every Monday.
+#        Values: 0 - Disabled
+#                1 - Enabled
+#        Default: 1
+#
+
+MythicPlus.WeeklyAffixes.Enable = 1
+
+#
+#    MythicPlus.KeystoneUpgradePct
+#        Description: The percentage of time remaining required to upgrade a keystone by +2.
+#        Default: 0.20 - 20%
+#
+
+MythicPlus.KeystoneUpgradePct = 0.20
+
+#
+#    MythicPlus.KeystoneHighUpgradePct
+#        Description: The percentage of time remaining required to upgrade a keystone by +3.
+#        Default: 0.40 - 40%
+#
+
+MythicPlus.KeystoneHighUpgradePct = 0.40
+

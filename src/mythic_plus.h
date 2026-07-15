@@ -1,11 +1,13 @@
 /*
  * Credits: silviu20092
+ * Retail-like enhancements: Great Vault, Auto-Upgrade Keystone, Weekly Affixes, Timer Broadcast
  */
 
 #ifndef _MYTHIC_PLUS_H_
 #define _MYTHIC_PLUS_H_
 
 #include <random>
+#include <ctime>
 #include "Player.h"
 
 class MythicAffix;
@@ -81,6 +83,27 @@ public:
         ENTER_STATE_OK
     };
 
+    // ── Retail: Great Vault ───────────────────────────────────────────────────
+    // Tracks the best M+ run per player per week. On weekly reset (Monday UTC)
+    // the player may claim a single reward item scaled to their best run level.
+    struct GreatVaultEntry
+    {
+        uint32 guid;          // character guid
+        uint16 weekNumber;    // ISO week number (1-53)
+        uint16 year;          // calendar year (avoids wrap-around)
+        uint8  bestLevel;     // highest M+ level completed this week
+        bool   claimed;       // has the vault reward been claimed?
+    };
+
+    // ── Retail: Keystone upgrade tiers ───────────────────────────────────────
+    // After completing a M+ dungeon within the time limit the keystone level
+    // upgrades automatically.  Upgrade amount depends on how much time remains.
+    //   +1 — any in-time completion
+    //   +2 — finished with ≥UpgradePct% of time to spare  (default 20 %)
+    //   +3 — finished with ≥HighUpgradePct% to spare       (default 40 %)
+    // Failing to beat the timer downgrades the keystone by 1 (min level 2).
+    enum KeystoneUpgradeTier { UPGRADE_FAIL = -1, UPGRADE_PLUS1 = 1, UPGRADE_PLUS2 = 2, UPGRADE_PLUS3 = 3 };
+
     struct MythicPlusDungeonInfo
     {
         uint32 instanceId;
@@ -141,6 +164,7 @@ public:
         static std::mt19937_64 RandomEngine();
         static bool CanBeHeroic(uint32 map);
         static float HealthMod(int32 rank);
+        static void SendAddonMessage(Player* player, std::string const& prefix, std::string const& text);
     };
 
     struct DBAffix
@@ -189,6 +213,15 @@ public:
     };
 public:
     static MythicPlus* instance();
+
+    // ── Retail config knobs (populated from ProcessConfig) ───────────────────
+    bool GetAutoUpgradeKeystoneEnabled()  const { return autoUpgradeKeystone; }
+    bool GetGreatVaultEnabled()           const { return greatVaultEnabled; }
+    bool GetTimerBroadcastEnabled()       const { return timerBroadcastEnabled; }
+    bool GetWeeklyAffixesEnabled()        const { return weeklyAffixesEnabled; }
+    float GetUpgradePct()                 const { return upgradePct; }
+    float GetHighUpgradePct()             const { return highUpgradePct; }
+    uint32 GetGreatVaultItemEntry()       const { return greatVaultItemEntry; }
 
     static constexpr uint32 NPC_LIGHTNING_SPHERE = 200006;
 
@@ -277,6 +310,29 @@ public:
     void LoadIgnoredEntriesForMultiplyAffixFromDB();
     void LoadScaleMapFromDB();
     void LoadSpellOverridesFromDB();
+
+    // ── Retail: Great Vault ──────────────────────────────────────────────────
+    void LoadGreatVaultFromDB();
+    void UpdateGreatVault(Player* player, uint8 completedLevel);
+    bool ClaimGreatVault(Player* player);
+    const GreatVaultEntry* GetGreatVault(const Player* player) const;
+    void ResetWeeklyVaults();   // called every Monday 00:00 UTC
+    void CheckWeeklyReset();
+
+    // ── Retail: Auto Keystone Upgrade ────────────────────────────────────────
+    // Determines upgrade tier and adjusts the player's stored keystone level.
+    // totalTime  — elapsed seconds
+    // timeLimit  — dungeon timer limit in seconds
+    // beaten     — true if finished within time limit
+    void AutoUpgradeKeystoneForMap(Map* map, uint64 totalTime, uint32 timeLimit, bool beaten);
+    KeystoneUpgradeTier GetUpgradeTier(uint64 totalTime, uint32 timeLimit) const;
+
+    // ── Retail: Weekly Affix Rotation ────────────────────────────────────────
+    // Returns the active affix indices for the current ISO week.
+    // Used when WeeklyAffixes is enabled to override random per-restart affixes.
+    static uint32 GetCurrentISOWeek();  // 1-53
+    static uint32 GetCurrentISOYear();
+    void ApplyWeeklyAffixSeed();        // called at startup & weekly reset
 private:
     std::unordered_map<uint32, MythicPlusCapableDungeon> mythicPlusDungeons;
     std::unordered_map<uint32, MythicPlusDungeonInfo> mythicPlusDungeonInfo;
@@ -286,6 +342,23 @@ private:
     uint32 penaltyOnDeath;
     uint32 keystoneBuyTimer;
     bool dropKeystoneOnCompletion;
+
+    // ── Retail config fields ─────────────────────────────────────────────────
+    bool   autoUpgradeKeystone    = true;
+    bool   greatVaultEnabled      = true;
+    bool   timerBroadcastEnabled  = true;
+    bool   weeklyAffixesEnabled   = true;
+    float  upgradePct             = 0.20f;  // 20% time remaining → +2
+    float  highUpgradePct         = 0.40f;  // 40% time remaining → +3
+    uint32 greatVaultItemEntry    = 29434;  // default: Badges of Justice
+
+    // ── Great Vault store ────────────────────────────────────────────────────
+    // key: character guid
+    std::unordered_map<uint32, GreatVaultEntry> greatVaultData;
+
+    // ── Weekly tracking ──────────────────────────────────────────────────────
+    uint16 lastKnownWeek = 0;
+    uint16 lastKnownYear = 0;
 
     MythicLevelContainer mythicLevels;
 

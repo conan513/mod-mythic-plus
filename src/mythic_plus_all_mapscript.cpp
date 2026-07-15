@@ -88,6 +88,26 @@ public:
 
                 sMythicPlus->PrintMythicLevelInfo(mapData->mythicLevel, player);
 
+                // --- Sync entering player's retail M+ UI ---
+                MythicPlus::Utils::SendAddonMessage(player, "MODERNWOW", "M+:START:" + Acore::ToString(map->GetId()) + ":" + Acore::ToString(mapData->timeLimit) + ":" + Acore::ToString(mapData->mythicLevel->level) + ":" + Acore::ToString(mapData->deaths) + ":" + Acore::ToString(mapData->penaltyOnDeath));
+                if (!mapData->done)
+                {
+                    long long diff = GameTime::GetGameTime().count() - mapData->mythicPlusStartTimer;
+                    MythicPlus::Utils::SendAddonMessage(player, "MODERNWOW", "M+:TIME:" + Acore::ToString(diff) + ":" + Acore::ToString(mapData->deaths));
+                }
+
+                QueryResult bResult = CharacterDatabase.Query("SELECT creature_entry FROM mythic_plus_dungeon_snapshot WHERE id = {} AND starttime = {}", map->GetInstanceId(), savedDungeon->startTime);
+                if (bResult)
+                {
+                    do
+                    {
+                        Field* fields = bResult->Fetch();
+                        uint32 entry = fields[0].Get<uint32>();
+                        MythicPlus::Utils::SendAddonMessage(player, "MODERNWOW", "M+:BOSS:" + Acore::ToString(entry));
+                    } while (bResult->NextRow());
+                }
+
+
                 std::ostringstream oss;
                 if (!mapData->done)
                 {
@@ -152,13 +172,50 @@ public:
             ASSERT(mapData);
             if (mapData->receiveLoot && !mapData->done)
             {
+                uint32 oldSeconds = mapData->updateTimer / 1000;
+                mapData->updateTimer += diff;
+                uint32 newSeconds = mapData->updateTimer / 1000;
+
+                if (sMythicPlus->GetTimerBroadcastEnabled())
+                {
+                    uint32 penalty = mapData->GetPenaltyTime();
+                    uint32 totalElapsed = newSeconds + penalty;
+                    
+                    if (totalElapsed <= mapData->timeLimit)
+                    {
+                        uint32 remaining = mapData->timeLimit - totalElapsed;
+                        uint32 oldRemaining = mapData->timeLimit - (oldSeconds + penalty);
+
+                        bool shouldAnnounce = false;
+                        std::string timeStr;
+
+                        auto checkCross = [&](uint32 targetSec) {
+                            return oldRemaining > targetSec && remaining <= targetSec;
+                        };
+
+                        if (checkCross(1200)) { shouldAnnounce = true; timeStr = "20 minutes"; }
+                        else if (checkCross(900)) { shouldAnnounce = true; timeStr = "15 minutes"; }
+                        else if (checkCross(600)) { shouldAnnounce = true; timeStr = "10 minutes"; }
+                        else if (checkCross(300)) { shouldAnnounce = true; timeStr = "5 minutes"; }
+                        else if (checkCross(180)) { shouldAnnounce = true; timeStr = "3 minutes"; }
+                        else if (checkCross(60))  { shouldAnnounce = true; timeStr = "1 minute"; }
+                        else if (checkCross(30))  { shouldAnnounce = true; timeStr = "30 seconds"; }
+                        else if (checkCross(10))  { shouldAnnounce = true; timeStr = "10 seconds"; }
+
+                        if (shouldAnnounce)
+                        {
+                            std::ostringstream oss;
+                            oss << "Mythic Plus: " << timeStr << " remaining!";
+                            MythicPlus::BroadcastToMap(map, MythicPlus::Utils::Colored(oss.str(), "ffff00"));
+                        }
+                    }
+                }
+
                 if (mapData->updateTimer / 1000 + mapData->GetPenaltyTime() > mapData->timeLimit)
                 {
                     MythicPlus::AnnounceToMap(map, "Time's up! You will not receive any Mythic Plus loot anymore.");
                     mapData->receiveLoot = false;
                 }
-
-                mapData->updateTimer += diff;
             }
 
             for (auto* affix : mapData->mythicLevel->affixes)
@@ -202,6 +259,16 @@ public:
                         mapData->timeLimit = timeLimit;
                         mapData->deaths = 0;
                         mapData->penaltyOnDeath = sMythicPlus->GetPenaltyOnDeath();
+
+                        // --- Broadcast M+ START to all players on the map ---
+                        Map::PlayerList const& players = map->GetPlayers();
+                        for (Map::PlayerList::const_iterator itr = players.begin(); itr != players.end(); ++itr)
+                        {
+                            if (Player* pl = itr->GetSource())
+                            {
+                                MythicPlus::Utils::SendAddonMessage(pl, "MODERNWOW", "M+:START:" + Acore::ToString(map->GetId()) + ":" + Acore::ToString(timeLimit) + ":" + Acore::ToString(mlevel) + ":" + Acore::ToString(0) + ":" + Acore::ToString(sMythicPlus->GetPenaltyOnDeath()));
+                            }
+                        }
 
                         if (mapData->penaltyOnDeath > 0)
                             sMythicPlus->BroadcastToMap(map, MythicPlus::Utils::RedColored("Dying will give a penalty of " + secsToTimeString(mapData->penaltyOnDeath)));

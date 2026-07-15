@@ -95,6 +95,9 @@ public:
                     MythicPlus::MapData* mapData = sMythicPlus->GetMapData(map, false);
                     ASSERT(mapData);
 
+                    // --- Sync boss kill with client GUI ---
+                    MythicPlus::Utils::SendAddonMessage(player, "MODERNWOW", "M+:BOSS:" + Acore::ToString(creature->GetEntry()));
+
                     if (finalBoss)
                     {
                         std::ostringstream oss2;
@@ -108,9 +111,16 @@ public:
                             rewarded = true;
                             sMythicPlus->Reward(player, mapData->mythicLevel->reward);
                         }
+
+                        // Great Vault Update
+                        sMythicPlus->UpdateGreatVault(player, savedDungeon->mythicLevel);
+
                         mapData->done = true;
 
                         sMythicPlus->SaveDungeonInfo(map->GetInstanceId(), map->GetId(), mapData->timeLimit, mapData->mythicPlusStartTimer, mapData->mythicLevel->level, mapData->penaltyOnDeath, mapData->deaths, true);
+
+                        // --- Sync end of M+ dungeon with client GUI ---
+                        MythicPlus::Utils::SendAddonMessage(player, "MODERNWOW", "M+:END:" + Acore::ToString(gameTime - savedDungeon->startTime) + ":" + Acore::ToString(mapData->receiveLoot ? 1 : 0));
                     }
 
                     const MythicLevel* mythicLevel = sMythicPlus->GetMythicLevel(savedDungeon->mythicLevel);
@@ -133,6 +143,15 @@ public:
                         mapData->deaths,
                         mythicLevel->randomAffixCount
                     );
+                }
+            }
+
+            if (sMythicPlus->IsFinalBoss(creature->GetEntry()))
+            {
+                MythicPlus::MapData* mapData = sMythicPlus->GetMapData(map, false);
+                if (mapData)
+                {
+                    sMythicPlus->AutoUpgradeKeystoneForMap(map, gameTime - savedDungeon->startTime, savedDungeon->timeLimit, mapData->receiveLoot);
                 }
             }
         }

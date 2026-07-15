@@ -4,6 +4,7 @@
 
 #include <iomanip>
 #include <algorithm>
+#include <chrono>
 #include "AreaDefines.h"
 #include "Chat.h"
 #include "Group.h"
@@ -18,6 +19,15 @@ MythicPlus::MythicPlus()
     penaltyOnDeath = 15;
     keystoneBuyTimer = 1440;
     dropKeystoneOnCompletion = true;
+    autoUpgradeKeystone   = true;
+    greatVaultEnabled     = true;
+    timerBroadcastEnabled = true;
+    weeklyAffixesEnabled  = true;
+    upgradePct            = 0.20f;
+    highUpgradePct        = 0.40f;
+    greatVaultItemEntry   = 29434;
+    lastKnownWeek = 0;
+    lastKnownYear = 0;
 }
 
 MythicPlus::~MythicPlus()
@@ -218,6 +228,17 @@ void MythicPlus::LoadFromDB()
     LoadMythicRewardsFromDB();
     LoadMythicLevelsFromDB();
     LoadSpellOverridesFromDB();
+
+    // Retail: load Great Vault state
+    LoadGreatVaultFromDB();
+
+    // Retail: apply deterministic weekly affix seed if enabled
+    if (weeklyAffixesEnabled)
+        ApplyWeeklyAffixSeed();
+
+    // Remember the current week so the worldscript can detect Monday roll-over
+    lastKnownWeek = static_cast<uint16>(GetCurrentISOWeek());
+    lastKnownYear = static_cast<uint16>(GetCurrentISOYear());
 }
 
 MythicPlus::MythicPlusDungeonInfo* MythicPlus::GetSavedDungeonInfo(uint32 instanceId)
@@ -781,6 +802,18 @@ void MythicPlus::LoadSpellOverridesFromDB()
     }
 }
 
+/*static*/ void MythicPlus::Utils::SendAddonMessage(Player* player, std::string const& prefix, std::string const& text)
+{
+    if (!player || !player->GetSession())
+        return;
+
+    WorldPacket data;
+    std::string msg = prefix + "\t" + text;
+    ChatHandler::BuildChatPacket(data, CHAT_MSG_WHISPER, msg, LANG_ADDON, CHAT_TAG_NONE, player->GetGUID(), player->GetName(), player->GetGUID(), player->GetName());
+    player->GetSession()->SendPacket(&data);
+}
+
+
 bool MythicPlus::IsFinalBoss(uint32 entry) const
 {
     for (const auto& d : mythicPlusDungeons)
@@ -973,9 +1006,18 @@ void MythicPlus::ProcessConfig(bool reload)
     if (!reload)
         enabled = sConfigMgr->GetOption<bool>("MythicPlus.Enable", true);
 
-    penaltyOnDeath = sConfigMgr->GetOption<uint32>("MythicPlus.Penalty.OnDeath", 15);
-    keystoneBuyTimer = sConfigMgr->GetOption<uint32>("MythicPlus.KeystoneBuyTimer", 1440);
+    penaltyOnDeath        = sConfigMgr->GetOption<uint32>("MythicPlus.Penalty.OnDeath", 15);
+    keystoneBuyTimer      = sConfigMgr->GetOption<uint32>("MythicPlus.KeystoneBuyTimer", 1440);
     dropKeystoneOnCompletion = sConfigMgr->GetOption<bool>("MythicPlus.DropKeystoneOnDungeonComplete", true);
+
+    // ── Retail features ──────────────────────────────────────────────────────
+    autoUpgradeKeystone   = sConfigMgr->GetOption<bool>  ("MythicPlus.AutoUpgradeKeystone",    true);
+    greatVaultEnabled     = sConfigMgr->GetOption<bool>  ("MythicPlus.GreatVault.Enable",       true);
+    timerBroadcastEnabled = sConfigMgr->GetOption<bool>  ("MythicPlus.TimerBroadcast.Enable",   true);
+    weeklyAffixesEnabled  = sConfigMgr->GetOption<bool>  ("MythicPlus.WeeklyAffixes.Enable",    true);
+    upgradePct            = sConfigMgr->GetOption<float> ("MythicPlus.KeystoneUpgradePct",      0.20f);
+    highUpgradePct        = sConfigMgr->GetOption<float> ("MythicPlus.KeystoneHighUpgradePct",  0.40f);
+    greatVaultItemEntry   = sConfigMgr->GetOption<uint32>("MythicPlus.GreatVault.ItemEntry",    29434);
 }
 
 bool MythicPlus::MatchMythicPlusMapDiff(const Map* map) const
@@ -1172,3 +1214,345 @@ const MythicPlus::SpellOverride* MythicPlus::GetSpellOverride(const Map* map, ui
 
     return nullptr;
 }
+
+// ── Great Vault Implementation ───────────────────────────────────────────────
+
+void MythicPlus::LoadGreatVaultFromDB()
+{
+    greatVaultData.clear();
+
+    QueryResult result = CharacterDatabase.Query("SELECT guid, week, year, best_level, claimed FROM modernwow_mythicplus_vault");
+    if (!result)
+        return;
+
+    do
+    {
+        Field* fields = result->Fetch();
+        uint32 guid = fields[0].Get<uint32>();
+        uint16 week = fields[1].Get<uint16>();
+        uint16 year = fields[2].Get<uint16>();
+        uint8 bestLevel = fields[3].Get<uint8>();
+        bool claimed = fields[4].Get<bool>();
+
+        greatVaultData[guid] = { guid, week, year, bestLevel, claimed };
+    } while (result->NextRow());
+}
+
+void MythicPlus::UpdateGreatVault(Player* player, uint8 completedLevel)
+{
+    if (!greatVaultEnabled || !player)
+        return;
+
+    uint32 guid = Utils::PlayerGUID(player);
+    uint16 currentWeek = static_cast<uint16>(GetCurrentISOWeek());
+    uint16 currentYear = static_cast<uint16>(GetCurrentISOYear());
+
+    GreatVaultEntry& entry = greatVaultData[guid];
+    
+    // If it's a new week, reset the entry
+    if (entry.weekNumber != currentWeek || entry.year != currentYear)
+    {
+        entry.guid = guid;
+        entry.weekNumber = currentWeek;
+        entry.year = currentYear;
+        entry.bestLevel = completedLevel;
+        entry.claimed = false;
+    }
+    else
+    {
+        if (completedLevel > entry.bestLevel)
+            entry.bestLevel = completedLevel;
+    }
+
+    CharacterDatabase.Execute("REPLACE INTO modernwow_mythicplus_vault (guid, week, year, best_level, claimed) VALUES ({}, {}, {}, {}, {})",
+        guid, entry.weekNumber, entry.year, entry.bestLevel, entry.claimed ? 1 : 0);
+
+    BroadcastToPlayer(player, "Your Great Vault record has been updated! Current best M+ run this week: Level " + Acore::ToString(entry.bestLevel));
+}
+
+bool MythicPlus::ClaimGreatVault(Player* player)
+{
+    if (!greatVaultEnabled || !player)
+        return false;
+
+    uint32 guid = Utils::PlayerGUID(player);
+    auto it = greatVaultData.find(guid);
+    
+    uint16 currentWeek = static_cast<uint16>(GetCurrentISOWeek());
+    uint16 currentYear = static_cast<uint16>(GetCurrentISOYear());
+
+    // We can only claim if:
+    // 1. There is an entry.
+    // 2. The entry is NOT from the current week (i.e. it's from a past week, since Vault is claimed in the *following* week).
+    //    Or, if we want to follow retail: at the start of currentWeek, you claim rewards from the previous week.
+    // Let's store the previous week's vault in DB. Wait, if the entry is from a past week and not claimed, we can claim it.
+    if (it == greatVaultData.end())
+    {
+        BroadcastToPlayer(player, "You don't have any Great Vault rewards available.");
+        return false;
+    }
+
+    GreatVaultEntry& entry = it->second;
+
+    if (entry.claimed)
+    {
+        BroadcastToPlayer(player, "You have already claimed this week's Great Vault rewards.");
+        return false;
+    }
+
+    // Is it from a previous week? (To claim, the vault week must be older than the current week)
+    bool isPastWeek = false;
+    if (entry.year < currentYear)
+        isPastWeek = true;
+    else if (entry.year == currentYear && entry.weekNumber < currentWeek)
+        isPastWeek = true;
+
+    if (!isPastWeek)
+    {
+        BroadcastToPlayer(player, "Great Vault rewards can only be claimed next week (after weekly reset on Monday). Your current best run is Level " + Acore::ToString(entry.bestLevel));
+        return false;
+    }
+
+    if (entry.bestLevel == 0)
+    {
+        BroadcastToPlayer(player, "You didn't complete any Mythic Plus dungeons in the previous week.");
+        return false;
+    }
+
+    // Calculate reward amount based on the level of the best run
+    // E.g. base reward count = bestLevel * scaling factor
+    uint32 count = entry.bestLevel * 2; // 2 Badges of Justice per level
+    if (count == 0) count = 1;
+
+    if (!player->AddItem(greatVaultItemEntry, count))
+    {
+        BroadcastToPlayer(player, "Could not add Great Vault reward items. Please free up some bag space.");
+        return false;
+    }
+
+    entry.claimed = true;
+    CharacterDatabase.Execute("UPDATE modernwow_mythicplus_vault SET claimed = 1 WHERE guid = {} AND week = {} AND year = {}",
+        guid, entry.weekNumber, entry.year);
+
+    std::string itemName = "items";
+    if (const ItemTemplate* proto = sObjectMgr->GetItemTemplate(greatVaultItemEntry))
+        itemName = Utils::ItemName(proto, player);
+
+    BroadcastToPlayer(player, "Successfully claimed Great Vault rewards for week " + Acore::ToString(entry.weekNumber) + "! Received " + Acore::ToString(count) + "x " + itemName + ".");
+    Utils::VisualFeedback(player);
+    return true;
+}
+
+const MythicPlus::GreatVaultEntry* MythicPlus::GetGreatVault(const Player* player) const
+{
+    if (!player)
+        return nullptr;
+
+    auto it = greatVaultData.find(Utils::PlayerGUID(player));
+    if (it != greatVaultData.end())
+        return &it->second;
+
+    return nullptr;
+}
+
+void MythicPlus::ResetWeeklyVaults()
+{
+    // Normally we don't clear the db entries because players need to claim them,
+    // but we can set up the lastKnownWeek/Year updates.
+    // If a player logs in and has a past week's unclaimed vault, they claim it, then
+    // when they run a new M+, it replaces the past week's vault.
+    lastKnownWeek = static_cast<uint16>(GetCurrentISOWeek());
+    lastKnownYear = static_cast<uint16>(GetCurrentISOYear());
+    LOG_INFO("module", "Mythic Plus: Weekly reset processed for week {}, year {}.", lastKnownWeek, lastKnownYear);
+
+    if (weeklyAffixesEnabled)
+        ApplyWeeklyAffixSeed();
+}
+
+void MythicPlus::CheckWeeklyReset()
+{
+    uint32 currentWeek = GetCurrentISOWeek();
+    uint32 currentYear = GetCurrentISOYear();
+
+    if (currentWeek != lastKnownWeek || currentYear != lastKnownYear)
+    {
+        ResetWeeklyVaults();
+    }
+}
+
+
+// ── Auto Keystone Upgrade Implementation ─────────────────────────────────────
+
+void MythicPlus::AutoUpgradeKeystoneForMap(Map* map, uint64 totalTime, uint32 timeLimit, bool beaten)
+{
+    if (!autoUpgradeKeystone)
+        return;
+
+    // Get group leader
+    Map::PlayerList const& players = map->GetPlayers();
+    if (players.IsEmpty())
+        return;
+
+    Player* leader = nullptr;
+    for (Map::PlayerList::const_iterator itr = players.begin(); itr != players.end(); ++itr)
+    {
+        if (Player* pl = itr->GetSource())
+        {
+            if (pl->GetGroup())
+            {
+                ObjectGuid leaderGuid = pl->GetGroup()->GetLeaderGUID();
+                leader = ObjectAccessor::FindConnectedPlayer(leaderGuid);
+                if (leader)
+                    break;
+            }
+            else
+            {
+                // Solo player (if supported/configured)
+                leader = pl;
+                break;
+            }
+        }
+    }
+
+    if (!leader)
+        return;
+
+    uint32 currentLvl = GetCurrentMythicPlusLevel(leader);
+    if (currentLvl == 0)
+        return;
+
+    KeystoneUpgradeTier tier = GetUpgradeTier(totalTime, timeLimit);
+    int32 levelDiff = static_cast<int32>(tier);
+
+    int32 newLevel = static_cast<int32>(currentLvl) + levelDiff;
+    if (newLevel < 2)
+        newLevel = 2; // minimum is 2
+
+    // Apply the level change to the leader
+    SetCurrentMythicPlusLevel(leader, static_cast<uint32>(newLevel), true);
+
+    // Apply to all group members who also had that level or update their personal keystones if they had one
+    // In retail, a keystone itself updates. Here, player level is saved per player.
+    // Let's announce the keystone upgrade/downgrade to everyone
+    std::string announceMsg;
+    if (levelDiff > 0)
+    {
+        announceMsg = "Keystone upgraded by +" + Acore::ToString(levelDiff) + "! New level: " + Acore::ToString(newLevel);
+        // Also reward a new keystone item if they don't have one (though in retail it just transforms)
+    }
+    else
+    {
+        announceMsg = "Keystone depleted. Level decreased by 1. New level: " + Acore::ToString(newLevel);
+    }
+
+    for (Map::PlayerList::const_iterator itr = players.begin(); itr != players.end(); ++itr)
+    {
+        if (Player* pl = itr->GetSource())
+        {
+            BroadcastToPlayer(pl, Utils::GreenColored(announceMsg));
+            // Also sync group members M+ level to leader's new level if they don't have group or if we want them to progress together
+            if (pl != leader)
+            {
+                // In retail, only the keystone owner's keystone upgrades/changes.
+                // But in this mod, the leader's level is used to start it.
+                // We should keep the leader's level as the source of truth, but we can also update group members levels to match so they can run it next time.
+                SetCurrentMythicPlusLevel(pl, static_cast<uint32>(newLevel), true);
+            }
+
+            // Give them the keystone item if configured
+            if (levelDiff > 0 && dropKeystoneOnCompletion)
+            {
+                // Remove old keystone and reward new one
+                RemoveKeystone(pl);
+                RewardKeystone(pl);
+            }
+        }
+    }
+}
+
+MythicPlus::KeystoneUpgradeTier MythicPlus::GetUpgradeTier(uint64 totalTime, uint32 timeLimit) const
+{
+    if (totalTime > timeLimit)
+        return UPGRADE_FAIL;
+
+    double timeRemainingPct = 1.0 - (static_cast<double>(totalTime) / static_cast<double>(timeLimit));
+
+    if (timeRemainingPct >= highUpgradePct)
+        return UPGRADE_PLUS3;
+    else if (timeRemainingPct >= upgradePct)
+        return UPGRADE_PLUS2;
+    
+    return UPGRADE_PLUS1;
+}
+
+// ── Weekly Affix Rotation & ISO Calculations ────────────────────────────────
+
+uint32 MythicPlus::GetCurrentISOWeek()
+{
+    std::time_t now = std::time(nullptr);
+    std::tm* timeinfo = std::gmtime(&now);
+    char buffer[4];
+    std::strftime(buffer, sizeof(buffer), "%V", timeinfo); // ISO 8601 week number
+    return static_cast<uint32>(std::atoi(buffer));
+}
+
+uint32 MythicPlus::GetCurrentISOYear()
+{
+    std::time_t now = std::time(nullptr);
+    std::tm* timeinfo = std::gmtime(&now);
+    char buffer[6];
+    std::strftime(buffer, sizeof(buffer), "%G", timeinfo); // ISO 8601 year
+    return static_cast<uint32>(std::atoi(buffer));
+}
+
+void MythicPlus::ApplyWeeklyAffixSeed()
+{
+    uint32 week = GetCurrentISOWeek();
+    uint32 year = GetCurrentISOYear();
+    uint32 seed = year * 100 + week;
+
+    LOG_INFO("module", "Mythic Plus: Applying weekly affix seed {} (Year: {}, Week: {})", seed, year, week);
+
+    // Let's seed the random generator using this weekly seed so the shuffle is consistent across all server instances and restarts during the same week.
+    std::mt19937 weeklyEngine(seed);
+
+    // Re-generate affixes for all mythic levels based on this week's seed
+    for (auto& level : mythicLevels)
+    {
+        // First delete any previous random affixes
+        level.affixes.erase(
+            std::remove_if(level.affixes.begin(), level.affixes.end(), [](MythicAffix* a) {
+                if (a && a->IsRandom())
+                {
+                    delete a;
+                    return true;
+                }
+                return false;
+            }),
+            level.affixes.end()
+        );
+
+        if (level.randomAffixCount > 0)
+        {
+            // Instead of standard MythicAffix::GenerateRandom which uses random_device,
+            // we implement a deterministic pool selection using weeklyEngine.
+            std::vector<uint32> pool;
+            for (uint32 i = 0; i < MythicAffix::RANDOM_AFFIX_MAX_COUNT; ++i)
+                pool.push_back(MythicAffix::RandomAffixes[i]);
+
+            std::shuffle(pool.begin(), pool.end(), weeklyEngine);
+
+            uint32 count = std::min<uint32>(level.randomAffixCount, pool.size());
+            for (uint32 i = 0; i < count; ++i)
+            {
+                MythicAffix* affix = MythicAffix::AffixFactory((MythicAffixType)pool[i]);
+                if (affix)
+                {
+                    // Mark as random so we can clean it up later
+                    level.affixes.push_back(affix);
+                }
+            }
+        }
+    }
+}
+

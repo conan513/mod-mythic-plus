@@ -32,6 +32,8 @@ public:
         {
             sMythicPlus->LoadMythicPlusSnapshotsFromDB();
             sMythicPlus->ResetMythicSnapshotsTimer();
+
+            sMythicPlus->CheckWeeklyReset();
         }
 
         sMythicPlus->UpdateMythicSnapshotsTimer(diff);

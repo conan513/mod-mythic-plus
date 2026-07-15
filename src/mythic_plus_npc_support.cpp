@@ -116,6 +116,33 @@ void MythicPlusNpcSupport::AddMainMenu(Player* player, Creature* creature)
     randomMythicIdnt->optionIcon = GOSSIP_ICON_BATTLE;
     pagedData.data.push_back(randomMythicIdnt);
 
+    if (sMythicPlus->GetGreatVaultEnabled())
+    {
+        Identifier* vaultIdnt = new Identifier();
+        vaultIdnt->id = 11;
+        std::ostringstream voss;
+        voss << MythicPlus::Utils::Colored("Great Vault (Weekly Reward)", "0d852d");
+
+        const MythicPlus::GreatVaultEntry* entry = sMythicPlus->GetGreatVault(player);
+        if (entry && !entry->claimed)
+        {
+            uint16 currentWeek = static_cast<uint16>(MythicPlus::GetCurrentISOWeek());
+            uint16 currentYear = static_cast<uint16>(MythicPlus::GetCurrentISOYear());
+            
+            bool isPastWeek = false;
+            if (entry->year < currentYear)
+                isPastWeek = true;
+            else if (entry->year == currentYear && entry->weekNumber < currentWeek)
+                isPastWeek = true;
+
+            if (isPastWeek && entry->bestLevel > 0)
+                voss << MythicPlus::Utils::GreenColored(" [REWARD READY]");
+        }
+        vaultIdnt->uiName = voss.str();
+        vaultIdnt->optionIcon = GOSSIP_ICON_MONEY_BAG;
+        pagedData.data.push_back(vaultIdnt);
+    }
+
     Identifier* bye = new Identifier();
     bye->id = 10;
     bye->uiName = "Nevermind...";
@@ -673,6 +700,12 @@ bool MythicPlusNpcSupport::TakePagedDataAction(Player* player, Creature* creatur
         }
         else if (action == 10)
         {
+            CloseGossipMenuFor(player);
+            return true;
+        }
+        else if (action == 11)
+        {
+            sMythicPlus->ClaimGreatVault(player);
             CloseGossipMenuFor(player);
             return true;
         }

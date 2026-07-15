@@ -18,6 +18,7 @@ public:
         static ChatCommandTable mythicCommandTable =
         {
             { "info",           HandleMythicInfoCommand,                SEC_PLAYER,             Console::No  },
+            { "vault",          HandleMythicVaultCommand,               SEC_PLAYER,             Console::No  },
             { "reload",         HandleMythicReloadCommand,              SEC_ADMINISTRATOR,      Console::Yes }
         };
         static ChatCommandTable commandTable =
@@ -42,6 +43,51 @@ private:
         }
         else
             handler->SendSysMessage("You are not in a Mythic Plus dungeon right now.");
+
+        return true;
+    }
+
+    static bool HandleMythicVaultCommand(ChatHandler* handler, Optional<std::string> subCommand)
+    {
+        Player* player = handler->GetPlayer();
+        if (!player)
+            return false;
+
+        if (!sMythicPlus->GetGreatVaultEnabled())
+        {
+            handler->SendSysMessage("Great Vault is currently disabled.");
+            return true;
+        }
+
+        std::string sub = subCommand ? *subCommand : "";
+        if (sub == "claim")
+        {
+            sMythicPlus->ClaimGreatVault(player);
+            return true;
+        }
+
+        const MythicPlus::GreatVaultEntry* entry = sMythicPlus->GetGreatVault(player);
+        uint16 currentWeek = static_cast<uint16>(MythicPlus::GetCurrentISOWeek());
+        uint16 currentYear = static_cast<uint16>(MythicPlus::GetCurrentISOYear());
+
+        handler->SendSysMessage("--- Great Vault Status ---");
+        if (!entry)
+        {
+            handler->SendSysMessage("No dungeons completed this week yet.");
+        }
+        else if (entry->weekNumber == currentWeek && entry->year == currentYear)
+        {
+            handler->SendSysMessage("Your current best run this week: Level " + Acore::ToString(entry->bestLevel));
+            handler->SendSysMessage("These rewards will be claimable next week after the Monday reset.");
+        }
+        else
+        {
+            handler->SendSysMessage("Unclaimed rewards from week " + Acore::ToString(entry->weekNumber) + ": Level " + Acore::ToString(entry->bestLevel) + " run.");
+            if (entry->claimed)
+                handler->SendSysMessage("Status: Claimed.");
+            else
+                handler->SendSysMessage("Status: Unclaimed. Type '/mythic vault claim' to claim your rewards!");
+        }
 
         return true;
     }
